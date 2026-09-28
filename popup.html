@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bili 接力</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="logo" aria-hidden="true">▶</div>
+    <div><h1>Bili 接力<span>RELAY</span></h1><p>把打开的视频，连成一场放映。</p></div>
+    <span id="stateBadge" class="badge">待开始</span>
+  </header>
+  <main>
+    <section class="speed-card" aria-labelledby="speedHeading">
+      <div class="section-top"><h2 id="speedHeading">播放倍速</h2><span class="eyebrow">YOUR PACE</span></div>
+      <div class="speed-editor">
+        <button id="slower" class="round" aria-label="减慢 0.25 倍">−</button>
+        <label class="speed-value"><input id="speed" type="number" min="0.0625" max="16" step="any" value="1" aria-label="自定义倍速"><span>×</span></label>
+        <button id="faster" class="round" aria-label="加快 0.25 倍">+</button>
+      </div>
+      <div class="presets" aria-label="常用倍速">
+        <button data-speed="0.5">0.5×</button><button data-speed="1">1×</button><button data-speed="1.5">1.5×</button><button data-speed="2">2×</button><button data-speed="3">3×</button><button data-speed="4">4×</button>
+      </div>
+      <p class="hint">每次 ±0.25× · 同步调整已打开的视频</p>
+      <div class="default-speed">
+        <label for="defaultSpeed">默认倍速<small>新开、刷新或切换视频时自动使用</small></label>
+        <input id="defaultSpeed" type="number" min="0.0625" max="16" step="any" value="1" aria-label="默认倍速">
+        <span>×</span><button id="saveDefault">保存</button>
+      </div>
+      <p id="defaultSaved" class="hint" role="status">临时加减倍速不会改变默认值</p>
+    </section>
+
+    <section class="queue-section" aria-labelledby="queueHeading">
+      <div class="section-top"><h2 id="queueHeading">接力队列 <span id="queueCount">0</span></h2><span class="queue-order">标签页从左到右</span></div>
+      <div id="empty" class="empty"><div class="empty-icon" aria-hidden="true">▤ <span>▶</span></div><strong>好视频，一个接一个</strong><p>在当前窗口打开多个 B 站视频，<br>点击下方按钮，即可依次播放。</p></div>
+      <ol id="queue" aria-label="视频播放队列"></ol>
+      <p id="progress" class="progress" hidden></p>
+      <p id="error" role="alert" hidden></p>
+      <button id="start" class="primary"><span>▶</span> 开始顺序播放</button>
+      <div id="transport" class="transport" hidden><button id="pause">Ⅱ 暂停队列</button><button id="next">下一条 →</button><button id="stop" aria-label="结束队列">结束</button></div>
+      <button id="restart" class="text-button" hidden>重新读取标签页并从头播放</button>
+    </section>
+    <section class="options" aria-label="播放设置">
+      <label><span>自动加入新打开的视频<small>开始后，新视频追加到队尾</small></span><input id="autoAdd" type="checkbox" checked role="switch"></label>
+      <label><span>接力时切换到视频标签页<small>自动显示当前正在播放的视频</small></span><input id="followTab" type="checkbox" checked role="switch"></label>
+    </section>
+  </main>
+  <footer><span class="dot"></span>仅管理当前窗口中的普通视频页 <span>本地运行</span></footer>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
