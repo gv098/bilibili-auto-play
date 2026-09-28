@@ -1,6 +1,6 @@
 {
   "name": "bili-relay",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "private": true,
   "type": "module",
   "scripts": { "test": "node --test", "check": "node --check background.js && node --check content.js && node --check popup.js && node --check core.js" }

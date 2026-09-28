@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { videoKey, validSpeed, orderedVideos, newState, policyFor } from '../core.js';
+import { videoKey, validSpeed, orderedVideos, discoverVideos, newState, policyFor } from '../core.js';
 
 test('accepts ordinary desktop videos and distinguishes parts, rejecting other origins', () => {
   assert.equal(videoKey('https://www.bilibili.com/video/BV1CN8g6yEwJ/?spm_id_from=333&p=2'), 'BV1CN8g6yEwJ?p=2');
@@ -25,4 +25,19 @@ test('only the active queue member receives play permission', () => {
   assert.equal(policyFor(state, 2).mode, 'hold');
   state.status = 'idle';
   assert.equal(policyFor(state, 2).mode, 'free');
+});
+test('preview keeps known live videos with missing URLs but drops closed or navigated tabs', () => {
+  const previous = [1, 2, 3].map(id => ({ id, url: `https://www.bilibili.com/video/BVtest${id}/`, title: `Video ${id}` }));
+  assert.deepEqual(orderedVideos([{ id: 1, index: 1 }, { id: 2, index: 0, url: 'https://example.com' }], previous).map(item => item.id), [1]);
+});
+test('an existing page script identifies a video when tab URL metadata is unavailable', async () => {
+  const result = await discoverVideos({
+    async query() { return [{ id: 1, index: 0 }, { id: 2, index: 1 }]; },
+    async sendMessage(id) {
+      if (id === 1) return { url: 'https://www.bilibili.com/video/BV1XfYf6kEHP/?spm_id_from=333.1387', title: 'Still playing' };
+      throw new Error('No receiver');
+    },
+  }, 1);
+  assert.equal(result.videos.length, 1);
+  assert.equal(result.videos[0].key, 'BV1XfYf6kEHP?p=1');
 });

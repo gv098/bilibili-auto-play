@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { STORAGE_KEY } from '../core.js';
 
 const listeners = {};
-let saved = {}, tabs = [], deliveries = [], focused = [];
+let saved = {}, tabs = [], deliveries = [], focused = [], slowTab = null;
 const event = name => ({ addListener(fn) { listeners[name] = fn; } });
 globalThis.chrome = {
   runtime: { onMessage: event('message'), onStartup: event('startup') },
@@ -16,7 +16,10 @@ globalThis.chrome = {
   tabs: {
     onRemoved: event('removed'), onUpdated: event('updated'),
     async query(query) { return structuredClone(tabs.filter(tab => query.windowId === undefined || tab.windowId === query.windowId)); },
-    async sendMessage(id, payload) { deliveries.push({ id, ...structuredClone(payload.policy) }); },
+    async sendMessage(id, payload) {
+      deliveries.push({ id, ...structuredClone(payload.policy) });
+      if (slowTab?.id === id) await slowTab.promise;
+    },
     async get(id) { const tab = tabs.find(tab => tab.id === id); if (!tab) throw Error('closed'); return tab; },
     async reload() {},
     async update(id) { focused.push(id); },
@@ -25,7 +28,7 @@ globalThis.chrome = {
 await import('../background.js');
 
 const video = (id, index, windowId = 1) => ({ id, index, windowId, title: `视频 ${id}_哔哩哔哩_bilibili`, url: `https://www.bilibili.com/video/BVtest${id}/` });
-function reset() { saved = {}; deliveries = []; focused = []; tabs = [video(1, 2), video(2, 0), video(3, 1), video(4, 0, 2)]; }
+function reset() { saved = {}; deliveries = []; focused = []; slowTab = null; tabs = [video(1, 2), video(2, 0), video(3, 1), video(4, 0, 2)]; }
 function request(message, tabId) { return new Promise(resolve => listeners.message(message, tabId ? { tab: tabs.find(tab => tab.id === tabId) || { id: tabId } } : {}, resolve)); }
 async function state() { return (await request({ type: 'GET_STATE' })).state; }
 async function start() { return (await request({ type: 'START', windowId: 1 })).state; }
@@ -192,4 +195,48 @@ test('invalid defaults are rejected and previous-version speed migrates', async 
   assert.equal((await request({ type: 'HELLO' }, 1)).policy.speed, 2.5);
   assert.equal((await request({ type: 'SET_DEFAULT_SPEED', speed: 20 })).ok, false);
   assert.equal((await state()).defaultSpeed, 2.5);
+});
+test('slow waiting tabs do not delay current speed, pause, or resume commands', async () => {
+  reset(); await start();
+  let release;
+  slowTab = { id: 3, promise: new Promise(resolve => { release = resolve; }) };
+  listeners.updated(3, { status: 'complete' }, tabs.find(tab => tab.id === 3));
+  let timeout;
+  const operations = (async () => {
+    await request({ type: 'SET_SPEED', speed: 2 }, 2);
+    await request({ type: 'PAUSE' });
+    await request({ type: 'RESUME' });
+    return true;
+  })();
+  try {
+    const completed = await Promise.race([operations, new Promise(resolve => { timeout = setTimeout(() => resolve(false), 500); })]);
+    assert.equal(completed, true, 'current controls waited for an unrelated tab');
+    assert.equal((await state()).status, 'running');
+    assert.equal(deliveries.filter(d => d.id === 2).at(-1).speed, 2);
+    const revisions = deliveries.filter(d => d.id === 2).map(d => d.revision);
+    assert.ok(revisions.at(-1) > revisions.at(-2));
+  } finally {
+    clearTimeout(timeout);
+    release();
+    await operations;
+    slowTab = null;
+  }
+});
+test('partial tab updates and temporarily unavailable URLs do not delete queue entries', async () => {
+  reset(); const before = await start();
+  listeners.updated(2, { title: 'Updated title' }, { id: 2, windowId: 1 });
+  listeners.updated(3, { status: 'loading' }, { id: 3, windowId: 1, status: 'loading' });
+  listeners.updated(1, { status: 'complete' }, { id: 1, windowId: 1 });
+  const after = await state();
+  assert.deepEqual(after.items.map(item => item.id), before.items.map(item => item.id));
+  assert.equal(after.activeTabId, 2);
+  assert.equal(after.status, 'running');
+  assert.equal(after.items[0].key, before.items[0].key);
+});
+test('resume preserves existing tabs whose URLs are temporarily missing', async () => {
+  reset(); await start(); await request({ type: 'PAUSE' });
+  for (const tab of tabs) delete tab.url;
+  const result = await request({ type: 'RESUME' });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.state.items.map(item => item.id), [2, 3, 1]);
 });

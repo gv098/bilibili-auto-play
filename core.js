@@ -24,7 +24,7 @@ export function newState() {
   return {
     speed: 1, defaultSpeed: 1, speedOverrides: {}, autoAdd: true, followTab: true,
     status: 'idle', windowId: null, activeTabId: null,
-    token: 0, items: [], error: '',
+    token: 0, revision: 0, items: [], error: '',
   };
 }
 
@@ -33,8 +33,31 @@ export function makeItem(tab) {
     title: (tab.title || '哔哩哔哩视频').replace(/_哔哩哔哩_bilibili$/, ''), status: 'waiting' };
 }
 
-export function orderedVideos(tabs) {
-  return tabs.filter(tab => videoKey(tab.url)).sort((a, b) => a.index - b.index).map(makeItem);
+export function orderedVideos(tabs, previous = []) {
+  const known = new Map(previous.map(item => [item.id, item]));
+  return tabs.map(tab => ({ ...tab,
+    url: tab.url || (videoKey(tab.pendingUrl) ? tab.pendingUrl : known.get(tab.id)?.url),
+    title: tab.title || known.get(tab.id)?.title,
+  })).filter(tab => videoKey(tab.url)).sort((a, b) => a.index - b.index).map(makeItem);
+}
+
+export async function discoverVideos(tabsApi, windowId, previous = []) {
+  const tabs = await tabsApi.query({ windowId });
+  const knownIds = new Set(previous.map(item => item.id));
+  await Promise.all(tabs.map(async tab => {
+    if (tab.url || knownIds.has(tab.id) || videoKey(tab.pendingUrl)) return;
+    let timer;
+    try {
+      // Existing content scripts can identify their page if the tabs API omits URL.
+      const description = await Promise.race([
+        tabsApi.sendMessage(tab.id, { type: 'DESCRIBE_VIDEO' }),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 400); }),
+      ]);
+      if (videoKey(description?.url)) Object.assign(tab, { url: description.url, title: tab.title || description.title });
+    } catch { /* No content script on this tab; retain any last known metadata. */ }
+    finally { clearTimeout(timer); }
+  }));
+  return { tabs, videos: orderedVideos(tabs, previous) };
 }
 
 export function policyFor(state, tabId) {
@@ -45,6 +68,7 @@ export function policyFor(state, tabId) {
     speed: state.speedOverrides?.[tabId]?.speed ?? state.defaultSpeed ?? state.speed,
     mode: !managed ? 'free' : active && ['running', 'blocked'].includes(state.status) ? 'play' : active && state.status === 'paused' ? 'paused' : 'hold',
     token: state.token, key: item?.key || null,
+    revision: state.revision ?? 0,
     status: state.status,
   };
 }

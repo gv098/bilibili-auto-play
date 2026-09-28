@@ -1,4 +1,4 @@
-import { STORAGE_KEY, MIN_SPEED, MAX_SPEED, newState, videoKey, validSpeed, orderedVideos, makeItem, policyFor } from './core.js';
+import { STORAGE_KEY, MIN_SPEED, MAX_SPEED, newState, videoKey, validSpeed, discoverVideos, makeItem, policyFor } from './core.js';
 
 // Serialize events, including duplicate ended notifications and tabs closing mid-transition.
 let serial = Promise.resolve();
@@ -14,9 +14,12 @@ async function readState() {
 }
 
 async function save(state) {
+  state.revision += 1;
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
-  await chrome.action.setBadgeText({ text: state.status === 'running' ? '▶' : state.status === 'blocked' ? '!' : state.status === 'paused' ? 'Ⅱ' : '' });
-  await chrome.action.setBadgeBackgroundColor({ color: '#008caa' });
+  await Promise.all([
+    chrome.action.setBadgeText({ text: state.status === 'running' ? '▶' : state.status === 'blocked' ? '!' : state.status === 'paused' ? 'Ⅱ' : '' }),
+    chrome.action.setBadgeBackgroundColor({ color: '#008caa' }),
+  ]);
 }
 
 async function deliver(tabId, policy) {
@@ -32,9 +35,18 @@ async function deliver(tabId, policy) {
   }
 }
 
-async function publish(state) {
+async function publish(state, { immediate = false, priorityTabId = state.activeTabId } = {}) {
   await save(state);
-  const tabs = (await chrome.tabs.query({})).filter(tab => tab.url?.startsWith('https://www.bilibili.com/'));
+  const queueIds = new Set(state.items.map(item => item.id));
+  const tabs = (await chrome.tabs.query({})).filter(tab => !tab.discarded && (tab.url?.startsWith('https://www.bilibili.com/') || (!tab.url && queueIds.has(tab.id))));
+  if (immediate) {
+    // Existing queue ownership is unchanged. Slow background tabs must not block a click.
+    const priority = tabs.find(tab => tab.id === priorityTabId);
+    const applied = priority ? deliver(priority.id, policyFor(state, priority.id)) : Promise.resolve();
+    void Promise.all(tabs.filter(tab => tab.id !== priorityTabId).map(tab => deliver(tab.id, policyFor(state, tab.id))));
+    await applied;
+    return;
+  }
   // Silence other players before starting the active player.
   await Promise.all(tabs.filter(tab => tab.id !== state.activeTabId).map(tab => deliver(tab.id, policyFor(state, tab.id))));
   if (state.activeTabId !== null) await deliver(state.activeTabId, policyFor(state, state.activeTabId));
@@ -50,10 +62,11 @@ async function activate(state, index) {
     return;
   }
   const item = state.items[index];
+  const continuing = state.activeTabId === item.id && ['running', 'paused', 'blocked'].includes(state.status);
   state.activeTabId = item.id;
   state.status = 'running';
   for (let i = 0; i < state.items.length; i++) state.items[i].status = i < index ? 'done' : i === index ? 'playing' : 'waiting';
-  await publish(state);
+  await publish(state, { immediate: continuing });
   try {
     const tab = await chrome.tabs.get(item.id);
     if (tab.discarded) await chrome.tabs.reload(item.id);
@@ -63,7 +76,8 @@ async function activate(state, index) {
 
 async function getLiveQueue(state) {
   const liveTabs = await chrome.tabs.query({ windowId: state.windowId });
-  const liveIds = new Set(liveTabs.filter(tab => videoKey(tab.url)).map(tab => tab.id));
+  // Missing URL metadata is not evidence that a live tab stopped being a video.
+  const liveIds = new Set(liveTabs.filter(tab => !tab.url || tab.status === 'loading' || tab.discarded || videoKey(tab.url)).map(tab => tab.id));
   state.items = state.items.filter(item => liveIds.has(item.id));
 }
 
@@ -71,7 +85,7 @@ async function command(message, sender) {
   const state = await readState();
   if (message.type === 'GET_STATE') return { state };
   if (message.type === 'HELLO') {
-    const tab = sender.tab;
+    const tab = sender.tab ? { ...sender.tab, url: sender.tab.url || sender.url } : null;
     if (tab && videoKey(tab.url) && !state.items.some(item => item.id === tab.id) && state.autoAdd && tab.windowId === state.windowId && ['running', 'paused', 'blocked'].includes(state.status)) {
       state.items.push(makeItem(tab));
       await save(state);
@@ -88,19 +102,19 @@ async function command(message, sender) {
       const key = videoKey(tab.url);
       if (key) state.speedOverrides[tab.id] = { key, speed: state.speed };
     }
-    await publish(state);
+    await publish(state, { immediate: true, priorityTabId: tabId });
   } else if (message.type === 'SET_DEFAULT_SPEED') {
     state.defaultSpeed = validSpeed(message.speed);
     state.speed = state.defaultSpeed;
     state.speedOverrides = {};
-    await publish(state);
+    await publish(state, { immediate: true, priorityTabId: message.tabId ?? state.activeTabId });
   } else if (message.type === 'SET_OPTIONS') {
     for (const key of ['autoAdd', 'followTab']) if (typeof message[key] === 'boolean') state[key] = message[key];
     await save(state);
   } else if (message.type === 'START') {
     const windowId = Number(message.windowId);
     if (!Number.isInteger(windowId)) throw new Error('未找到当前浏览器窗口');
-    const items = orderedVideos(await chrome.tabs.query({ windowId }));
+    const { videos: items } = await discoverVideos(chrome.tabs, windowId, state.items);
     if (!items.length) throw new Error('请先在当前窗口打开哔哩哔哩视频');
     // Release the previous queue if the user starts in another window.
     state.status = 'idle';
@@ -111,7 +125,7 @@ async function command(message, sender) {
   } else if (message.type === 'PAUSE') {
     if (['running', 'blocked'].includes(state.status)) {
       state.status = 'paused'; state.error = ''; state.token += 1;
-      await publish(state);
+      await publish(state, { immediate: true });
     }
   } else if (message.type === 'RESUME') {
     await getLiveQueue(state);
@@ -145,13 +159,13 @@ async function command(message, sender) {
       await save(state);
     } else if (message.type === 'USER_PAUSED') {
       state.status = 'paused'; state.token += 1;
-      await publish(state);
+      await publish(state, { immediate: true });
     } else {
       state.status = 'running'; state.error = '';
       await save(state);
     }
   } else throw new Error('未知操作');
-  return { state };
+  return { state, ...(sender.tab ? { policy: policyFor(state, sender.tab.id) } : {}) };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -182,25 +196,37 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
   if (!change.url && !change.title && !change.status) return;
   enqueue(async () => {
     const state = await readState();
-    const key = videoKey(tab.url);
+    const item = state.items.find(item => item.id === tabId);
+    const url = change.url || tab.url;
+    const key = videoKey(url);
+    if (!key) {
+      // A title/status-only event may omit URL; a loading tab may expose an interim URL.
+      // Only an explicit, settled navigation away may remove a queue member.
+      const loading = change.status === 'loading' || tab.status === 'loading' || tab.discarded;
+      if (item && url && !loading && (change.url || change.status === 'complete')) {
+        await removeTab(state, tabId);
+      } else if (item && (change.title || tab.title)) {
+        item.title = makeItem({ title: change.title || tab.title }).title;
+        await save(state);
+      }
+      return;
+    }
     if (state.speedOverrides[tabId] && (change.status === 'loading' || state.speedOverrides[tabId].key !== key)) {
       delete state.speedOverrides[tabId];
       await save(state);
     }
-    const item = state.items.find(item => item.id === tabId);
-    if (item && !key) { await removeTab(state, tabId); return; }
     if (item) {
       const changedVideo = item.key !== key;
-      Object.assign(item, { url: tab.url, key, title: makeItem(tab).title });
+      Object.assign(item, { url, key, title: makeItem({ title: change.title || tab.title || item.title }).title });
       if (changedVideo && tabId === state.activeTabId) state.token += 1;
       await save(state);
-      if (changedVideo || change.status === 'complete') await deliver(tabId, policyFor(state, tabId));
+      if (changedVideo || change.status === 'complete') void deliver(tabId, policyFor(state, tabId));
     } else if (key && state.autoAdd && tab.windowId === state.windowId && ['running', 'paused', 'blocked'].includes(state.status)) {
-      state.items.push(makeItem(tab));
+      state.items.push(makeItem({ ...tab, url }));
       await save(state);
-      await deliver(tabId, policyFor(state, tabId));
+      void deliver(tabId, policyFor(state, tabId));
     } else if (key && (change.url || change.status === 'complete')) {
-      await deliver(tabId, policyFor(state, tabId));
+      void deliver(tabId, policyFor(state, tabId));
     }
   });
 });

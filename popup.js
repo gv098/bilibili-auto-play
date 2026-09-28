@@ -1,4 +1,4 @@
-import { STORAGE_KEY, orderedVideos, policyFor, videoKey } from './core.js';
+import { STORAGE_KEY, MIN_SPEED, MAX_SPEED, validSpeed, discoverVideos, policyFor } from './core.js';
 
 const $ = id => document.getElementById(id);
 let state;
@@ -6,22 +6,54 @@ let windowId;
 let preview = [];
 let speedTabId = null;
 let commands = Promise.resolve();
+let pendingSpeed = null;
+let previewTimer;
+let previewGeneration = 0;
 const statusLabels = { idle: '待开始', running: '接力中', paused: '已暂停', blocked: '待继续', completed: '已完成' };
 
 function error(text) { $('error').textContent = text || ''; $('error').hidden = !text; }
+async function refreshPreview() {
+  if (windowId === undefined) return;
+  const generation = ++previewGeneration;
+  try {
+    const { tabs, videos } = await discoverVideos(chrome.tabs, windowId, [...preview, ...(state?.items || [])]);
+    if (generation !== previewGeneration) return;
+    preview = videos;
+    speedTabId = tabs.find(tab => tab.active && videos.some(item => item.id === tab.id))?.id ?? null;
+    render();
+  } catch (err) { error(`读取视频标签页失败：${err.message}`); }
+}
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => void refreshPreview(), 50);
+}
+function acceptState(next) {
+  if ((next.revision ?? 0) < (state?.revision ?? 0)) return;
+  state = next;
+  render();
+  if (state.status === 'idle') schedulePreview();
+}
+function currentSpeed() {
+  if (pendingSpeed) return pendingSpeed.speed;
+  if (!state) return 1;
+  const targetTabId = state.activeTabId ?? speedTabId;
+  return targetTabId == null ? state.speed : policyFor(state, targetTabId).speed;
+}
+function renderSpeed() {
+  const speed = currentSpeed();
+  if (document.activeElement !== $('speed')) $('speed').value = String(speed);
+  document.querySelectorAll('[data-speed]').forEach(button => {
+    const selected = Number(button.dataset.speed) === speed;
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-pressed', String(selected));
+  });
+}
 function render() {
   if (!state) return;
   const managed = state.status !== 'idle';
   const items = managed ? state.items : preview;
-  const targetTabId = state.activeTabId ?? speedTabId;
-  const currentSpeed = targetTabId == null ? state.speed : policyFor(state, targetTabId).speed;
-  if (document.activeElement !== $('speed')) $('speed').value = String(currentSpeed);
+  renderSpeed();
   if (document.activeElement !== $('defaultSpeed')) $('defaultSpeed').value = String(state.defaultSpeed);
-  document.querySelectorAll('[data-speed]').forEach(button => {
-    const selected = Number(button.dataset.speed) === currentSpeed;
-    button.classList.toggle('selected', selected);
-    button.setAttribute('aria-pressed', String(selected));
-  });
   $('stateBadge').textContent = statusLabels[state.status] || '待开始';
   $('stateBadge').classList.toggle('playing', state.status === 'running');
   $('queueCount').textContent = String(items.length);
@@ -63,17 +95,26 @@ async function execute(message) {
   try {
     const result = await chrome.runtime.sendMessage(message);
     if (!result?.ok) throw new Error(result?.error || '插件未响应，请重试');
-    state = result.state;
-    render();
+    acceptState(result.state);
     if (message.type === 'SET_DEFAULT_SPEED') $('defaultSaved').textContent = `已保存：新视频默认 ${state.defaultSpeed}×，当前页面也已应用`;
   } catch (err) { error(err.message); }
 }
-function setSpeed(speed) { return run({ type: 'SET_SPEED', speed }); }
+function setSpeed(value) {
+  let speed;
+  try { speed = validSpeed(value); } catch (err) { error(err.message); return; }
+  const request = { speed };
+  pendingSpeed = request;
+  $('speed').value = String(speed);
+  renderSpeed();
+  return run({ type: 'SET_SPEED', speed, tabId: state?.activeTabId ?? speedTabId }).finally(() => {
+    if (pendingSpeed === request) { pendingSpeed = null; renderSpeed(); }
+  });
+}
 $('speed').addEventListener('change', () => void setSpeed($('speed').value));
 $('speed').addEventListener('keydown', event => { if (event.key === 'Enter') $('speed').blur(); });
-$('slower').addEventListener('click', () => void run({ type: 'ADJUST_SPEED', direction: -1, tabId: state?.activeTabId ?? speedTabId }));
-$('faster').addEventListener('click', () => void run({ type: 'ADJUST_SPEED', direction: 1, tabId: state?.activeTabId ?? speedTabId }));
-$('saveDefault').addEventListener('click', () => void run({ type: 'SET_DEFAULT_SPEED', speed: $('defaultSpeed').value }));
+$('slower').addEventListener('click', () => void setSpeed(Math.max(MIN_SPEED, Math.round((currentSpeed() - 0.25) * 10000) / 10000)));
+$('faster').addEventListener('click', () => void setSpeed(Math.min(MAX_SPEED, Math.round((currentSpeed() + 0.25) * 10000) / 10000)));
+$('saveDefault').addEventListener('click', () => void run({ type: 'SET_DEFAULT_SPEED', speed: $('defaultSpeed').value, tabId: state?.activeTabId ?? speedTabId }));
 $('defaultSpeed').addEventListener('keydown', event => { if (event.key === 'Enter') { $('saveDefault').click(); $('defaultSpeed').blur(); } });
 document.querySelectorAll('[data-speed]').forEach(button => button.addEventListener('click', () => void setSpeed(button.dataset.speed)));
 $('start').addEventListener('click', () => void run({ type: 'START', windowId }));
@@ -83,12 +124,14 @@ $('next').addEventListener('click', () => void run({ type: 'NEXT' }));
 $('stop').addEventListener('click', () => void run({ type: 'STOP' }));
 for (const key of ['autoAdd', 'followTab']) $(key).addEventListener('change', () => void run({ type: 'SET_OPTIONS', [key]: $(key).checked }));
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes[STORAGE_KEY]?.newValue) { state = changes[STORAGE_KEY].newValue; render(); }
+  if (area === 'local' && changes[STORAGE_KEY]?.newValue) acceptState(changes[STORAGE_KEY].newValue);
 });
+chrome.tabs.onUpdated?.addListener((tabId, change, tab) => {
+  if ((tab.windowId === undefined || tab.windowId === windowId) && (change.url || change.title || change.status)) schedulePreview();
+});
+for (const event of ['onCreated', 'onRemoved', 'onMoved', 'onAttached', 'onDetached', 'onActivated']) chrome.tabs[event]?.addListener(schedulePreview);
 try {
   windowId = (await chrome.windows.getCurrent()).id;
-  const tabs = await chrome.tabs.query({ windowId });
-  speedTabId = tabs.find(tab => tab.active && videoKey(tab.url))?.id ?? null;
-  preview = orderedVideos(tabs);
+  await refreshPreview();
   await run({ type: 'GET_STATE' });
 } catch (err) { error(err.message); }

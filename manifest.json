@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bili 接力 · 倍速与顺序播放",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "description": "自由调节哔哩哔哩视频倍速，让多个视频标签页按顺序接力播放。",
   "permissions": ["storage", "scripting"],
   "host_permissions": ["https://www.bilibili.com/*"],

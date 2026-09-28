@@ -31,9 +31,16 @@ try {
       { id: 3, index: 2, title: '一口气看懂浏览器的工作原理', url: 'https://www.bilibili.com/video/BVtest3/' },
     ];
     let state = { speed: 1.5, defaultSpeed: 1.5, speedOverrides: {}, autoAdd: true, followTab: true, status: 'idle', items: [], activeTabId: null, windowId: 1, error: '' };
+    window.previewQueries = 0;
+    window.demoTabs = tabs;
+    window.tabEvents = {};
     window.chrome = {
       windows: { async getCurrent() { return { id: 1 }; } },
-      tabs: { async query() { return tabs; }, async update() {} },
+      tabs: { async query() { window.previewQueries += 1; return structuredClone(tabs); }, async update() {},
+        onUpdated: { addListener(fn) { window.tabEvents.updated = fn; } },
+        onCreated: { addListener(fn) { window.tabEvents.created = fn; } },
+        onRemoved: { addListener(fn) { window.tabEvents.removed = fn; } },
+      },
       storage: { onChanged: { addListener() {} } },
       runtime: { async sendMessage(message) {
         if (message.type === 'SET_SPEED' || message.type === 'ADJUST_SPEED') {
@@ -49,6 +56,24 @@ try {
     };
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/popup.html`);
+  await page.waitForFunction(() => document.querySelectorAll('#queue li').length === 3);
+  const beforePreviewRefresh = await page.evaluate(() => {
+    const count = window.previewQueries;
+    window.demoTabs.forEach(tab => { tab.originalUrl = tab.url; delete tab.url; });
+    window.tabEvents.updated(1, { status: 'complete' }, { id: 1 });
+    return count;
+  });
+  await page.waitForFunction(previous => window.previewQueries > previous, beforePreviewRefresh);
+  assert.equal(await page.locator('#queue li').count(), 3);
+  await page.evaluate(() => {
+    window.demoTabs.forEach(tab => { tab.url = tab.originalUrl; });
+    window.demoTabs.push({ id: 4, index: 3, title: 'New video', url: 'https://www.bilibili.com/video/BVtest4/' });
+    window.tabEvents.created();
+  });
+  await page.waitForFunction(() => document.querySelectorAll('#queue li').length === 4);
+  await page.evaluate(() => { window.demoTabs.pop(); window.tabEvents.removed(); });
+  await page.waitForFunction(() => document.querySelectorAll('#queue li').length === 3);
+  console.log('PASS: popup preview survives missing tab URLs and refreshes as tabs open/close');
   await page.getByRole('button', { name: '2×', exact: true }).click();
   assert.equal(await page.locator('#speed').inputValue(), '2');
   await page.locator('#speed').fill('2.75');
@@ -91,6 +116,7 @@ try {
       async sendMessage(message) {
         window.events.push(message);
         if (message.type === 'ADJUST_SPEED') window.applyRelay({ ...window.testPolicy, speed: window.testPolicy.speed + message.direction * 0.25 });
+        if (message.type === 'SET_SPEED') window.applyRelay({ ...window.testPolicy, speed: message.speed });
         return { ok: true, policy: window.testPolicy };
       },
     } };

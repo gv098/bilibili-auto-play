@@ -2,7 +2,7 @@
   if (globalThis.__biliRelayInstalled) return;
   globalThis.__biliRelayInstalled = true;
 
-  let policy = { mode: 'loading', speed: 1, token: 0, key: null };
+  let policy = { mode: 'loading', speed: 1, token: 0, revision: -1, key: null };
   let currentVideo = null;
   let panel, label, resume, speedInput;
   let endedToken = null;
@@ -10,6 +10,7 @@
   const expectedPauses = new WeakSet();
   let applyingPlay = null;
   let resumeRequest = null;
+  let pendingSpeed = null;
   const attached = new WeakSet();
   const originalLoops = new WeakMap();
   const positionKey = 'biliRelayPanelPosition';
@@ -102,6 +103,34 @@
   }
   function setSpeed(video) {
     try { if (video.playbackRate !== policy.speed) video.playbackRate = policy.speed; } catch { /* Unsupported player implementation. */ }
+  }
+  function changeSpeed(value) {
+    const speed = Number(value);
+    if (!Number.isFinite(speed) || speed < 0.0625 || speed > 16) {
+      speedInput.value = String(policy.speed);
+      show('倍速范围 0.0625～16');
+      return;
+    }
+    const previousSpeed = policy.speed;
+    const request = { speed };
+    pendingSpeed = request;
+    policy = { ...policy, speed };
+    if (currentVideo) setSpeed(currentVideo);
+    speedInput.value = String(speed);
+    updatePanel();
+    // Apply locally in the click handler; persistence and other tabs follow asynchronously.
+    void send('SET_SPEED', { speed }).then(result => {
+      if (pendingSpeed !== request) return;
+      pendingSpeed = null;
+      if (result?.ok) {
+        if (result.policy) apply(result.policy);
+      } else {
+        policy = { ...policy, speed: previousSpeed };
+        if (currentVideo) setSpeed(currentVideo);
+        updatePanel();
+        show('同步失败，请刷新页面后重试');
+      }
+    });
   }
   function show(text, canResume = false) {
     if (!label) return;
@@ -229,23 +258,12 @@
       else void play(currentVideo, true);
     });
     shadow.querySelectorAll('[data-speed]').forEach(button => {
-      button.addEventListener('click', async () => {
-        const result = await send('SET_SPEED', { speed: Number(button.dataset.speed) });
-        if (!result?.ok) show('设置失败，请刷新页面');
-      });
+      button.addEventListener('click', () => changeSpeed(button.dataset.speed));
     });
     for (const [id, direction] of [['slower', -1], ['faster', 1]]) {
-      shadow.getElementById(id).addEventListener('click', async () => {
-        const result = await send('ADJUST_SPEED', { direction });
-        if (!result?.ok) show('设置失败，请刷新页面');
-      });
+      shadow.getElementById(id).addEventListener('click', () => changeSpeed(Math.min(16, Math.max(0.0625, Math.round((policy.speed + direction * 0.25) * 10000) / 10000))));
     }
-    speedInput.addEventListener('change', async () => {
-      const speed = Number(speedInput.value);
-      if (!Number.isFinite(speed) || speed < 0.0625 || speed > 16) { speedInput.value = String(policy.speed); show('倍速范围 0.0625～16'); return; }
-      const result = await send('SET_SPEED', { speed });
-      if (!result?.ok) show('设置失败，请刷新页面');
-    });
+    speedInput.addEventListener('change', () => changeSpeed(speedInput.value));
     shadow.getElementById('collapse').addEventListener('click', () => panel.setAttribute('collapsed', ''));
     shadow.getElementById('expand').addEventListener('click', () => panel.removeAttribute('collapsed'));
     document.body.appendChild(panel);
@@ -254,8 +272,9 @@
   }
 
   function apply(next) {
+    if ((next.revision ?? 0) < (policy.revision ?? 0)) return;
     const shouldStart = next.mode === 'play' && (policy.mode !== 'play' || next.token !== policy.token);
-    policy = next;
+    policy = pendingSpeed ? { ...next, speed: pendingSpeed.speed } : next;
     createPanel();
     updatePanel();
     scan();
@@ -266,6 +285,7 @@
     }
   }
   chrome.runtime.onMessage.addListener((message, sender, respond) => {
+    if (message.type === 'DESCRIBE_VIDEO') { respond({ url: location.href, title: document.title }); return; }
     if (message.type === 'APPLY') { apply(message.policy); respond({ ok: true }); }
   });
   let scanQueued = false;
