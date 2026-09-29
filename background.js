@@ -1,4 +1,5 @@
 import { STORAGE_KEY, MIN_SPEED, MAX_SPEED, newState, videoKey, validSpeed, discoverVideos, makeItem, policyFor } from './core.js';
+import { loadVideoData, nextInSequence } from './sequence.js';
 
 // Serialize events, including duplicate ended notifications and tabs closing mid-transition.
 let serial = Promise.resolve();
@@ -23,6 +24,14 @@ async function save(state) {
 }
 
 async function deliver(tabId, policy) {
+  let timer;
+  try { return await Promise.race([
+    deliverNow(tabId, policy),
+    new Promise(resolve => { timer = setTimeout(() => resolve(false), 1500); }),
+  ]); } finally { clearTimeout(timer); }
+}
+
+async function deliverNow(tabId, policy) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'APPLY', policy });
     return true;
@@ -55,6 +64,7 @@ async function publish(state, { immediate = false, priorityTabId = state.activeT
 async function activate(state, index) {
   state.token += 1;
   state.error = '';
+  state.errorKind = '';
   if (index < 0 || index >= state.items.length) {
     state.activeTabId = null;
     state.status = 'completed';
@@ -62,6 +72,7 @@ async function activate(state, index) {
     return;
   }
   const item = state.items[index];
+  if (state.completeSeries) void loadVideoData(item.url).catch(() => {});
   const continuing = state.activeTabId === item.id && ['running', 'paused', 'blocked'].includes(state.status);
   state.activeTabId = item.id;
   state.status = 'running';
@@ -81,7 +92,45 @@ async function getLiveQueue(state) {
   state.items = state.items.filter(item => liveIds.has(item.id));
 }
 
-async function command(message, sender) {
+async function prepareSequence(state) {
+  const item = state.items.find(item => item.id === state.activeTabId);
+  const identity = { tabId: item.id, key: item.key, token: state.token, completeSeries: state.completeSeries };
+  if (!state.completeSeries) return { ...identity, next: null };
+  try { return { ...identity, next: nextInSequence(item.url, await loadVideoData(item.url, state.errorKind === 'sequence')) }; }
+  catch (error) { return { ...identity, error: error.message }; }
+}
+
+async function finishItem(state, item, prepared) {
+  if (state.completeSeries && (!prepared?.completeSeries || prepared.error)) {
+    state.status = 'blocked';
+    state.errorKind = 'sequence';
+    state.error = '无法读取分 P / 合集信息，请点击继续播放重试，或点击下一条跳过当前标签页。';
+    await save(state);
+    return;
+  }
+  const next = state.completeSeries ? prepared?.next : null;
+  if (!next) {
+    item.status = 'done';
+    await activate(state, state.items.indexOf(item) + 1);
+    return;
+  }
+  const previous = { url: item.url, key: item.key, title: item.title };
+  state.token += 1;
+  state.status = 'running'; state.error = ''; state.errorKind = '';
+  Object.assign(item, { url: next.url, key: videoKey(next.url), title: next.title, pendingUrl: next.url });
+  await save(state);
+  try {
+    await chrome.tabs.update(item.id, { url: next.url, ...(state.followTab ? { active: true } : {}) });
+  } catch {
+    Object.assign(item, previous);
+    delete item.pendingUrl;
+    state.status = 'blocked'; state.errorKind = 'sequence';
+    state.error = '打开下一分 P / 合集视频失败，请点击继续播放重试。';
+    await save(state);
+  }
+}
+
+async function command(message, sender, prepared) {
   const state = await readState();
   if (message.type === 'GET_STATE') return { state };
   if (message.type === 'HELLO') {
@@ -89,7 +138,11 @@ async function command(message, sender) {
     if (tab && videoKey(tab.url) && !state.items.some(item => item.id === tab.id) && state.autoAdd && tab.windowId === state.windowId && ['running', 'paused', 'blocked'].includes(state.status)) {
       state.items.push(makeItem(tab));
       await save(state);
+      if (state.activeTabId !== null) void deliver(state.activeTabId, policyFor(state, state.activeTabId));
     }
+    const item = state.items.find(item => item.id === tab?.id);
+    if (item?.pendingUrl && videoKey(tab.url) === item.key) { delete item.pendingUrl; await save(state); }
+    if (item?.id === state.activeTabId && state.completeSeries) void loadVideoData(item.url).catch(() => {});
     return { policy: policyFor(state, tab?.id) };
   }
   if (message.type === 'SET_SPEED' || message.type === 'ADJUST_SPEED') {
@@ -109,7 +162,7 @@ async function command(message, sender) {
     state.speedOverrides = {};
     await publish(state, { immediate: true, priorityTabId: message.tabId ?? state.activeTabId });
   } else if (message.type === 'SET_OPTIONS') {
-    for (const key of ['autoAdd', 'followTab']) if (typeof message[key] === 'boolean') state[key] = message[key];
+    for (const key of ['autoAdd', 'followTab', 'completeSeries']) if (typeof message[key] === 'boolean') state[key] = message[key];
     await save(state);
   } else if (message.type === 'START') {
     const windowId = Number(message.windowId);
@@ -128,10 +181,25 @@ async function command(message, sender) {
       await publish(state, { immediate: true });
     }
   } else if (message.type === 'RESUME') {
+    if (state.errorKind === 'sequence') {
+      const item = state.items.find(item => item.id === state.activeTabId);
+      if (item && prepared?.tabId === item.id && prepared.key === item.key && prepared.token === state.token) {
+        await finishItem(state, item, prepared);
+        await deliver(item.id, policyFor(state, item.id));
+      }
+      return { state, ...(sender.tab ? { policy: policyFor(state, sender.tab.id) } : {}) };
+    }
+    if (prepared) return { state }; // A pause/skip occurred while retry metadata was loading.
     await getLiveQueue(state);
     if (!state.items.length) throw new Error('队列中的视频已关闭，请重新开始');
     const index = state.items.findIndex(item => item.id === state.activeTabId);
     await activate(state, Math.max(index, 0));
+  } else if (message.type === 'USER_SELECTED') {
+    const item = state.items.find(item => item.id === sender.tab?.id);
+    if (item && !item.pendingUrl && state.status !== 'idle' && item.key === message.key && message.token === state.token) {
+      await activate(state, state.items.indexOf(item));
+    }
+    return { state, policy: policyFor(state, sender.tab?.id) };
   } else if (message.type === 'USER_RESUMED') {
     const item = state.items.find(item => item.id === sender.tab?.id);
     if (state.status === 'paused' && item?.id === state.activeTabId && item?.key === message.key && message.token === state.token) {
@@ -142,18 +210,23 @@ async function command(message, sender) {
     // Pause first; releasing management must not leave a video playing unexpectedly.
     state.status = 'paused'; state.token += 1;
     await publish(state);
-    state.status = 'idle'; state.activeTabId = null; state.items = []; state.error = '';
+    state.status = 'idle'; state.activeTabId = null; state.items = []; state.error = ''; state.errorKind = '';
     await publish(state);
-  } else if (message.type === 'NEXT' || message.type === 'PLAY_ITEM') {
-    const index = message.type === 'NEXT' ? state.items.findIndex(item => item.id === state.activeTabId) + 1 : state.items.findIndex(item => item.id === message.tabId);
+  } else if (['PREVIOUS', 'NEXT', 'PLAY_ITEM'].includes(message.type)) {
+    const currentIndex = state.items.findIndex(item => item.id === state.activeTabId);
+    if (sender.tab && message.type !== 'PLAY_ITEM') {
+      const policy = policyFor(state, sender.tab.id);
+      if (message.token !== state.token || message.key !== policy.key || !(message.type === 'PREVIOUS' ? policy.canPrevious : policy.canNext)) return { state, policy };
+    }
+    const index = message.type === 'PLAY_ITEM' ? state.items.findIndex(item => item.id === message.tabId) : currentIndex + (message.type === 'PREVIOUS' ? -1 : 1);
+    if (message.type === 'PREVIOUS' && currentIndex <= 0) return { state };
     if (message.type === 'PLAY_ITEM' && index < 0) throw new Error('该视频已不在队列中');
     await activate(state, index);
   } else if (['ENDED', 'BLOCKED', 'PLAYING', 'USER_PAUSED'].includes(message.type)) {
     const item = state.items.find(item => item.id === sender.tab?.id);
-    if (!item || item.id !== state.activeTabId || message.token !== state.token || message.key !== item.key || !['running', 'blocked'].includes(state.status)) return { state };
+    if (!item || item.id !== state.activeTabId || item.pendingUrl || message.token !== state.token || message.key !== item.key || !['running', 'blocked'].includes(state.status) || (state.errorKind === 'sequence' && message.type !== 'ENDED')) return { state, accepted: false, policy: policyFor(state, sender.tab?.id) };
     if (message.type === 'ENDED') {
-      item.status = 'done';
-      await activate(state, state.items.indexOf(item) + 1);
+      await finishItem(state, item, prepared);
     } else if (message.type === 'BLOCKED') {
       state.status = 'blocked'; state.error = message.reason === 'missing' ? '未检测到可播放的视频，请检查页面是否加载完成或需要登录。' : '浏览器暂未允许自动播放，请在视频页点击「继续播放」。';
       await save(state);
@@ -169,7 +242,22 @@ async function command(message, sender) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  enqueue(() => command(message, sender)).then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
+  // Metadata reads must not block pause/skip commands. Revalidate ownership afterwards.
+  const work = enqueue(async () => {
+    if (message.type === 'ENDED' || message.type === 'RESUME') {
+      const state = await readState();
+      const item = state.items.find(item => item.id === state.activeTabId);
+      const retry = message.type === 'RESUME' && state.errorKind === 'sequence';
+      const ended = message.type === 'ENDED' && item && item.id === sender.tab?.id && item.key === message.key && state.token === message.token && ['running', 'blocked'].includes(state.status);
+      if (item && !item.pendingUrl && (retry || ended)) return { snapshot: state };
+    }
+    return { result: await command(message, sender) };
+  }).then(async pending => {
+    if (!pending.snapshot) return pending.result;
+    const prepared = await prepareSequence(pending.snapshot);
+    return enqueue(() => command(message, sender, prepared));
+  });
+  work.then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });
 
@@ -216,15 +304,26 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
       await save(state);
     }
     if (item) {
+      // Ignore late status/title events from the document we are leaving.
+      if (item.pendingUrl && key !== videoKey(item.pendingUrl) && !change.url) return;
+      const arrived = item.pendingUrl && key === videoKey(item.pendingUrl);
+      if (arrived || change.url) delete item.pendingUrl;
       const changedVideo = item.key !== key;
       Object.assign(item, { url, key, title: makeItem({ title: change.title || tab.title || item.title }).title });
-      if (changedVideo && tabId === state.activeTabId) state.token += 1;
+      if (changedVideo && tabId === state.activeTabId) {
+        state.token += 1;
+        if (state.errorKind === 'sequence') {
+          state.error = ''; state.errorKind = '';
+          if (state.status === 'blocked') state.status = 'running';
+        }
+      }
       await save(state);
-      if (changedVideo || change.status === 'complete') void deliver(tabId, policyFor(state, tabId));
+      if (arrived || changedVideo || change.status === 'complete') void deliver(tabId, policyFor(state, tabId));
     } else if (key && state.autoAdd && tab.windowId === state.windowId && ['running', 'paused', 'blocked'].includes(state.status)) {
       state.items.push(makeItem({ ...tab, url }));
       await save(state);
       void deliver(tabId, policyFor(state, tabId));
+      if (state.activeTabId !== null) void deliver(state.activeTabId, policyFor(state, state.activeTabId));
     } else if (key && (change.url || change.status === 'complete')) {
       void deliver(tabId, policyFor(state, tabId));
     }
@@ -235,7 +334,7 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
 chrome.runtime.onStartup.addListener(() => {
   enqueue(async () => {
     const state = await readState();
-    Object.assign(state, { status: 'idle', items: [], activeTabId: null, windowId: null, error: '', token: state.token + 1, speed: state.defaultSpeed, speedOverrides: {} });
+    Object.assign(state, { status: 'idle', items: [], activeTabId: null, windowId: null, error: '', errorKind: '', token: state.token + 1, speed: state.defaultSpeed, speedOverrides: {} });
     await publish(state);
   });
 });

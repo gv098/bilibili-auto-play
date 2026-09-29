@@ -81,6 +81,7 @@ function render() {
   $('restart').hidden = !managed || state.status === 'completed';
   $('autoAdd').checked = state.autoAdd;
   $('followTab').checked = state.followTab;
+  $('completeSeries').checked = state.completeSeries ?? true;
   const currentIndex = items.findIndex(item => item.id === state.activeTabId);
   $('progress').hidden = !managed;
   $('progress').textContent = state.status === 'completed' ? '全部播放完成，下一场放映见。' : `第 ${Math.max(0, currentIndex + 1)} / ${items.length} 条${state.windowId !== windowId ? ' · 队列位于另一个窗口' : ''}`;
@@ -122,7 +123,7 @@ $('restart').addEventListener('click', () => void run({ type: 'START', windowId 
 $('pause').addEventListener('click', () => void run({ type: ['paused', 'blocked'].includes(state.status) ? 'RESUME' : 'PAUSE' }));
 $('next').addEventListener('click', () => void run({ type: 'NEXT' }));
 $('stop').addEventListener('click', () => void run({ type: 'STOP' }));
-for (const key of ['autoAdd', 'followTab']) $(key).addEventListener('change', () => void run({ type: 'SET_OPTIONS', [key]: $(key).checked }));
+for (const key of ['autoAdd', 'followTab', 'completeSeries']) $(key).addEventListener('change', () => void run({ type: 'SET_OPTIONS', [key]: $(key).checked }));
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes[STORAGE_KEY]?.newValue) acceptState(changes[STORAGE_KEY].newValue);
 });

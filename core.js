@@ -22,9 +22,9 @@ export function validSpeed(value) {
 
 export function newState() {
   return {
-    speed: 1, defaultSpeed: 1, speedOverrides: {}, autoAdd: true, followTab: true,
+    speed: 1, defaultSpeed: 1, speedOverrides: {}, autoAdd: true, followTab: true, completeSeries: true,
     status: 'idle', windowId: null, activeTabId: null,
-    token: 0, revision: 0, items: [], error: '',
+    token: 0, revision: 0, items: [], error: '', errorKind: '',
   };
 }
 
@@ -64,11 +64,14 @@ export function policyFor(state, tabId) {
   const item = state.items.find(item => item.id === tabId);
   const managed = Boolean(item) && !['idle'].includes(state.status);
   const active = managed && state.activeTabId === tabId;
+  const activeIndex = state.items.findIndex(item => item.id === state.activeTabId);
   return {
     speed: state.speedOverrides?.[tabId]?.speed ?? state.defaultSpeed ?? state.speed,
-    mode: !managed ? 'free' : active && ['running', 'blocked'].includes(state.status) ? 'play' : active && state.status === 'paused' ? 'paused' : 'hold',
+    mode: !managed ? 'free' : active && state.status === 'paused' ? 'paused' : active && item.pendingUrl ? 'transition' : active && state.errorKind === 'sequence' ? 'sequence-error' : active && ['running', 'blocked'].includes(state.status) ? 'play' : 'hold',
     token: state.token, key: item?.key || null,
     revision: state.revision ?? 0,
     status: state.status,
+    canPrevious: managed && activeIndex > 0,
+    canNext: managed && activeIndex >= 0 && activeIndex < state.items.length - 1,
   };
 }

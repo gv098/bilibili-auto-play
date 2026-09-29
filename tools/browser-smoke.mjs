@@ -184,7 +184,9 @@ try {
   await handle.dblclick();
   assert.equal(await floatingPanel.evaluate(element => element.style.left), '');
   assert.equal(await player.evaluate(() => sessionStorage.getItem('biliRelayPanelPosition')), null);
+  await player.evaluate(() => window.applyRelay({ ...window.testPolicy, mode: 'hold', status: 'running', canPrevious: true, canNext: true, speed: 3 }));
   await floatingPanel.screenshot({ path: path.join(root, 'artifacts/floating-panel-preview.png') });
+  console.log('Compact floating panel:', await floatingPanel.boundingBox());
   console.log('PASS: floating panel drag, saved position after reload, viewport bounds, collapse/expand, reset');
 } finally {
   await browser.close();

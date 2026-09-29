@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Bili 接力 · 倍速与顺序播放",
-  "version": "1.2.3",
+  "version": "1.3.2",
   "description": "自由调节哔哩哔哩视频倍速，让多个视频标签页按顺序接力播放。",
   "permissions": ["storage", "scripting"],
-  "host_permissions": ["https://www.bilibili.com/*"],
+  "host_permissions": ["https://www.bilibili.com/*", "https://api.bilibili.com/*"],
   "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
   "background": { "service_worker": "background.js", "type": "module" },
   "action": { "default_title": "Bili 接力", "default_popup": "popup.html", "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png" } },

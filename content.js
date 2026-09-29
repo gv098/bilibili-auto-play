@@ -6,11 +6,15 @@
   let currentVideo = null;
   let panel, label, resume, speedInput;
   let endedToken = null;
+  let endRequest = null;
   let missingTimer;
   const expectedPauses = new WeakSet();
   let applyingPlay = null;
   let resumeRequest = null;
   let pendingSpeed = null;
+  let navigating = false;
+  let playerGesture = null;
+  let selectionRequest = null;
   const attached = new WeakSet();
   const originalLoops = new WeakMap();
   const positionKey = 'biliRelayPanelPosition';
@@ -135,17 +139,31 @@
   function show(text, canResume = false) {
     if (!label) return;
     label.textContent = text;
+    label.title = text;
+    label.setAttribute('aria-label', text);
+    label.dataset.warning = String(canResume);
     resume.hidden = !canResume;
+    resume.textContent = policy.mode === 'hold' ? '播放此条' : '继续播放';
   }
   function updatePanel() {
     if (!panel) return;
     panel.hidden = !key();
+    panel.dataset.mode = policy.mode;
+    for (const [id, allowed] of [['previous', policy.canPrevious], ['next', policy.canNext]]) {
+      const button = panel.shadowRoot.getElementById(id);
+      button.disabled = navigating || !allowed;
+      button.title = policy.mode === 'free' || policy.mode === 'loading' ? '请先在扩展弹窗开始顺序播放' : id === 'previous' ? '接力队列中的前一个视频' : '接力队列中的后一个视频';
+    }
     if (panel.shadowRoot.activeElement !== speedInput) speedInput.value = String(policy.speed);
     panel.shadowRoot.querySelectorAll('[data-speed]').forEach(button => {
       button.setAttribute('aria-pressed', String(Number(button.dataset.speed) === policy.speed));
     });
     if (policy.mode === 'paused') show('队列已暂停', true);
-    else if (policy.mode === 'hold') show(policy.status === 'paused' ? '等待当前视频继续' : policy.status === 'completed' ? '队列播放完成' : '等待接力播放');
+    else if (policy.mode === 'advancing') show('本条播放完成，正在接力');
+    else if (policy.mode === 'transition') show('正在打开下一分 P / 合集视频');
+    else if (policy.mode === 'sequence-error') show('接力未完成，点击重试', true);
+    else if (policy.mode === 'hold') show(policy.status === 'paused' ? '队列已暂停，可播放此条' : policy.status === 'completed' ? '队列播放完成，可重播此条' : '等待接力，也可手动播放此条', true);
+    else if (policy.mode === 'selecting') show('正在切换到此条');
     else if (policy.mode === 'free') show('自由播放');
     else if (policy.mode === 'play') show(policy.status === 'blocked' ? '点击一次，继续接力' : '正在接力播放', policy.status === 'blocked');
   }
@@ -166,6 +184,25 @@
     } finally { if (applyingPlay === attempt) applyingPlay = null; }
   }
 
+  async function navigateQueue(type) {
+    if (navigating || !(type === 'PREVIOUS' ? policy.canPrevious : policy.canNext)) return;
+    navigating = true;
+    updatePanel();
+    let timer;
+    try {
+      const result = await Promise.race([
+        send(type),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 10000); }),
+      ]);
+      if (result?.ok && result.policy) apply(result.policy);
+      if (!result?.ok) show('切换失败，请重试');
+    } finally {
+      clearTimeout(timer);
+      navigating = false;
+      for (const [id, allowed] of [['previous', policy.canPrevious], ['next', policy.canNext]]) panel.shadowRoot.getElementById(id).disabled = !allowed;
+    }
+  }
+
   function resumePausedVideo(video, fromButton = false) {
     if (policy.mode !== 'paused' || policy.key !== key() || video !== currentVideo || resumeRequest) return;
     const previous = policy;
@@ -183,16 +220,59 @@
     }).finally(() => { resumeRequest = null; });
   }
 
+  async function selectVideo(video) {
+    if (policy.mode !== 'hold' || policy.key !== key() || video !== currentVideo || selectionRequest) return;
+    const request = { token: policy.token, key: key() };
+    selectionRequest = request;
+    playerGesture = null;
+    policy = { ...policy, mode: 'selecting' };
+    // The worker pauses the old owner before allowing this player to start.
+    pause(video);
+    updatePanel();
+    let timer;
+    try {
+      const result = await Promise.race([
+        send('USER_SELECTED', request),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 10000); }),
+      ]);
+      if (result?.ok && result.policy) apply(result.policy);
+      else if (policy.token === request.token && ['selecting', 'hold'].includes(policy.mode)) {
+        apply({ ...policy, mode: 'hold' });
+        show('切换失败，请点击播放此条重试', true);
+      }
+    } finally { clearTimeout(timer); selectionRequest = null; }
+  }
+
+  function manualPlay(video) {
+    if (policy.mode !== 'hold' || policy.key !== key() || video !== currentVideo || !playerGesture || playerGesture.video !== video || playerGesture.key !== key() || playerGesture.token !== policy.token || Date.now() > playerGesture.expires) return false;
+    playerGesture = null;
+    void selectVideo(video);
+    return true;
+  }
+
+  // A media play event is trusted even for autoplay. Require a recent real player
+  // interaction so background autoplay cannot take ownership of the queue.
+  for (const type of ['pointerdown', 'click', 'keydown']) document.addEventListener(type, event => {
+    if (!event.isTrusted || policy.mode !== 'hold' || !currentVideo) return;
+    const target = event.target;
+    if (!(target instanceof Element) || target.closest('#bili-relay-panel, input, textarea, select, [contenteditable="true"]')) return;
+    const inPlayer = target.closest('video, bwp-video, #bilibili-player, #bilibiliPlayer, .bpx-player-container');
+    if (type === 'keydown') {
+      if (event.repeat || event.ctrlKey || event.altKey || event.metaKey || !['Space', 'KeyK', 'Enter'].includes(event.code) || (!inPlayer && event.code === 'Enter')) return;
+    } else if (!inPlayer || (type === 'pointerdown' && event.button !== 0)) return;
+    playerGesture = { video: currentVideo, key: key(), token: policy.token, expires: Date.now() + 1500 };
+  }, true);
+
   function applyToVideo(video, shouldStart = false) {
     setSpeed(video);
-    if (['hold', 'paused', 'resuming', 'play'].includes(policy.mode)) {
+    if (['hold', 'paused', 'resuming', 'selecting', 'play', 'advancing', 'transition', 'sequence-error'].includes(policy.mode)) {
       if (!originalLoops.has(video)) originalLoops.set(video, video.loop);
       video.loop = false;
     } else if (policy.mode === 'free' && originalLoops.has(video)) {
       video.loop = originalLoops.get(video);
       originalLoops.delete(video);
     }
-    if (policy.mode === 'hold' || policy.mode === 'paused') pause(video);
+    if (['hold', 'paused', 'selecting', 'advancing', 'transition', 'sequence-error'].includes(policy.mode)) pause(video);
     if (policy.mode === 'play' && shouldStart) void play(video);
   }
   function scan() {
@@ -208,8 +288,9 @@
       video.addEventListener('loadedmetadata', () => applyToVideo(video, true));
       video.addEventListener('playing', () => {
         if (policy.mode === 'paused') { resumePausedVideo(video); return; }
-        if (policy.mode === 'hold') { pause(video); return; }
-        if (policy.mode === 'play') { show('正在接力播放'); void send('PLAYING'); }
+        if (manualPlay(video)) return;
+        if (['hold', 'selecting', 'advancing', 'transition', 'sequence-error'].includes(policy.mode)) { pause(video); return; }
+        if (policy.mode === 'play' && policy.key === key()) { show('正在接力播放'); void send('PLAYING'); }
       });
       video.addEventListener('pause', () => {
         if (expectedPauses.delete(video)) return;
@@ -221,20 +302,41 @@
     applyToVideo(video, changed);
   }
 
+  async function finishVideo() {
+    if (endRequest || policy.key !== key()) return;
+    const request = { token: policy.token, key: key() };
+    endRequest = request;
+    endedToken = request.token;
+    policy = { ...policy, mode: 'advancing' };
+    updatePanel();
+    let timer;
+    const result = await Promise.race([
+      send('ENDED', request),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 10000); }),
+    ]);
+    clearTimeout(timer);
+    if (endRequest !== request) return;
+    endRequest = null;
+    if (result?.ok && result.policy) apply(result.policy);
+    else if (policy.token === request.token && policy.mode === 'advancing') {
+      policy = { ...policy, mode: 'sequence-error' };
+      updatePanel();
+    }
+  }
+
   // Capture before the site's own ended handlers can start a recommendation or next part.
   document.addEventListener('ended', event => {
-    if (!isVideo(event.target) || event.target !== currentVideo || policy.mode !== 'play' || policy.key !== key()) return;
+    if (!isVideo(event.target) || event.target !== currentVideo || policy.key !== key() || !['play', 'advancing', 'transition', 'sequence-error'].includes(policy.mode)) return;
     event.stopImmediatePropagation();
+    if (policy.mode !== 'play') return;
     if (endedToken === policy.token) return;
-    endedToken = policy.token;
-    void send('ENDED');
-    policy = { ...policy, mode: 'hold' };
-    show('本条播放完成，正在接力');
+    void finishVideo();
   }, true);
   document.addEventListener('play', event => {
     if (!isVideo(event.target)) return;
     if (policy.mode === 'paused') resumePausedVideo(event.target);
-    else if (policy.mode === 'hold') pause(event.target);
+    else if (manualPlay(event.target)) return;
+    else if (['hold', 'selecting', 'advancing', 'transition', 'sequence-error'].includes(policy.mode)) pause(event.target);
   }, true);
 
   function createPanel() {
@@ -243,18 +345,26 @@
     panel.id = 'bili-relay-panel';
     const shadow = panel.attachShadow({ mode: 'open' });
     shadow.innerHTML = `<style>
-      :host{position:fixed;right:18px;bottom:24px;width:max-content;max-width:calc(100vw - 36px);z-index:2147483646;font:12px/1.5 system-ui,sans-serif;color:#e9f2f7} :host([hidden]){display:none}
-      .box{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 13px;border:1px solid #ffffff25;border-radius:14px;background:#122431ed;box-shadow:0 6px 25px #0003}
-      .box .brand{color:#67deed;font-weight:700;background:transparent;padding:0;cursor:grab;touch-action:none;user-select:none;white-space:nowrap}.brand::before{content:'⠿';margin-right:5px;color:#8badb7}:host([dragging]) .brand{cursor:grabbing} input{width:56px;background:#ffffff10;color:white;border:1px solid #ffffff30;border-radius:6px;padding:4px;font:inherit}
-      button{border:0;border-radius:6px;background:#68dce9;color:#10252e;padding:5px 8px;font:inherit;cursor:pointer} [hidden]{display:none}
-      .speed-controls{display:flex;align-items:center;gap:6px}.preset{background:#ffffff12;color:#a4e9f0;border:1px solid #68dce950;padding:3px 7px}.preset[aria-pressed="true"]{background:#68dce9;color:#10252e}.step{font-size:17px;min-width:26px;padding:1px 5px}.close{background:transparent;color:#a6bcc7;padding:0 2px;font-size:12px} .mini{display:none} :host([collapsed]) .detail{display:none} :host([collapsed]) .mini{display:block}
-    </style><div class="box"><button class="brand" aria-label="移动 Bili 接力浮窗" title="按住拖动 · 方向键移动 · 双击恢复默认位置">Bili 接力</button><span class="detail" id="status">连接中</span><span class="detail speed-controls"><button class="preset" data-speed="2" aria-pressed="false" title="直接切换为 2 倍速">2×</button><button class="preset" data-speed="3" aria-pressed="false" title="直接切换为 3 倍速">3×</button><button id="slower" class="step" aria-label="减慢 0.25 倍" title="减慢 0.25 倍">−</button><input aria-label="视频倍速" type="number" min="0.0625" max="16" step="any" value="1"> ×<button id="faster" class="step" aria-label="加快 0.25 倍" title="加快 0.25 倍">+</button></span><button id="resume" hidden>继续播放</button><button class="close detail" id="collapse" title="收起">收起</button><button class="mini" id="expand" title="展开">展开</button></div>`;
+      :host{position:fixed;right:18px;bottom:24px;width:max-content;max-width:calc(100vw - 36px);z-index:2147483646;font:12px/1.4 system-ui,sans-serif;color:#e9f2f7} :host([hidden]){display:none}
+      *{box-sizing:border-box}.box{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:6px 8px;border:1px solid #ffffff25;border-radius:10px;background:#122431ed;box-shadow:0 4px 18px #0003}
+      button{display:inline-flex;align-items:center;justify-content:center;height:26px;border:0;border-radius:5px;background:#68dce9;color:#10252e;padding:0 5px;font:inherit;cursor:pointer}button:disabled{opacity:.3;cursor:default}button:focus-visible,input:focus-visible{outline:2px solid #b5f5ff;outline-offset:2px}[hidden]{display:none}
+      .box .grip{width:14px;padding:0;background:transparent;color:#8badb7;font-size:16px;cursor:grab;touch-action:none;user-select:none}:host([dragging]) .grip{cursor:grabbing}
+      #status{width:8px;height:8px;overflow:hidden;font-size:0;border-radius:50%;background:#8badb7;flex:none}:host([data-mode="play"]) #status{background:#68dce9}#status[data-warning="true"]{background:#ffc46b}
+      .transport,.speed-controls{display:flex;align-items:center;gap:2px}.transport{gap:3px}.arrow{width:26px;font-size:17px;background:#ffffff12;color:#c7f5fa}
+      .preset{min-width:27px;background:#ffffff0c;color:#a4e9f0;border:1px solid #68dce940}.preset[aria-pressed="true"]{background:#68dce9;color:#10252e}.step{width:23px;font-size:17px;background:transparent;color:#a4e9f0}
+      input{width:43px;height:26px;background:#ffffff0c;color:white;border:1px solid #ffffff25;border-radius:5px;padding:0 2px;font:inherit;text-align:center;appearance:textfield}input:focus{width:58px}input::-webkit-inner-spin-button,input::-webkit-outer-spin-button{appearance:none;margin:0}
+      .close{background:transparent;color:#a6bcc7;padding:0 2px;font-size:11px}.mini{display:none}:host([collapsed]) .detail{display:none}:host([collapsed]) .mini{display:inline-flex}
+    </style><div class="box"><button class="grip" aria-label="移动 Bili 接力浮窗" title="按住拖动 · 方向键移动 · 双击恢复默认位置">⠿</button><span class="detail" id="status" role="status">连接中</span><span class="detail transport"><button id="previous" class="arrow" aria-label="前一个视频" disabled>←</button><button id="next" class="arrow" aria-label="后一个视频" disabled>→</button></span><span class="detail speed-controls"><button class="preset" data-speed="2" aria-pressed="false" title="直接切换为 2 倍速">2×</button><button class="preset" data-speed="3" aria-pressed="false" title="直接切换为 3 倍速">3×</button><button id="slower" class="step" aria-label="减慢 0.25 倍" title="减慢 0.25 倍">−</button><input aria-label="视频倍速" title="自定义倍速" type="number" min="0.0625" max="16" step="any" value="1"><button id="faster" class="step" aria-label="加快 0.25 倍" title="加快 0.25 倍">+</button></span><button id="resume" hidden>继续播放</button><button class="close detail" id="collapse" title="收起">收起</button><button class="close mini" id="expand" title="展开">展开</button></div>`;
     label = shadow.getElementById('status');
     resume = shadow.getElementById('resume');
     speedInput = shadow.querySelector('input');
+    shadow.getElementById('previous').addEventListener('click', () => void navigateQueue('PREVIOUS'));
+    shadow.getElementById('next').addEventListener('click', () => void navigateQueue('NEXT'));
     resume.addEventListener('click', () => {
+      if (policy.mode === 'sequence-error') { void finishVideo(); return; }
       if (!currentVideo) return;
-      if (policy.mode === 'paused') resumePausedVideo(currentVideo, true);
+      if (policy.mode === 'hold') void selectVideo(currentVideo);
+      else if (policy.mode === 'paused') resumePausedVideo(currentVideo, true);
       else void play(currentVideo, true);
     });
     shadow.querySelectorAll('[data-speed]').forEach(button => {
@@ -268,11 +378,14 @@
     shadow.getElementById('expand').addEventListener('click', () => panel.removeAttribute('collapsed'));
     document.body.appendChild(panel);
     updatePanel();
-    enableDragging(shadow.querySelector('.brand'));
+    enableDragging(shadow.querySelector('.grip'));
   }
 
   function apply(next) {
     if ((next.revision ?? 0) < (policy.revision ?? 0)) return;
+    // Speed/settings broadcasts during metadata loading must not replay an ended video.
+    if (endRequest && next.token === endRequest.token && next.key === endRequest.key && next.mode === 'play') next = { ...next, mode: 'advancing' };
+    if (endRequest && (next.token !== endRequest.token || next.key !== endRequest.key || next.mode === 'paused' || next.mode === 'hold' || next.mode === 'free')) endRequest = null;
     const shouldStart = next.mode === 'play' && (policy.mode !== 'play' || next.token !== policy.token);
     policy = pendingSpeed ? { ...next, speed: pendingSpeed.speed } : next;
     createPanel();
